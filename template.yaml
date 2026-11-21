@@ -1,0 +1,647 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Catch-all test inboxes read over a JSON API, compatible with restmail.net.
+  SES receipt rule -> S3 -> Lambda, read through a Lambda function URL.
+
+Parameters:
+  Domain:
+    Type: String
+    Description: Domain to receive mail for, lower case (for example inbox.example.com). Every address at it becomes a mailbox.
+    AllowedPattern: ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route 53 hosted zone to add the MX and DKIM records to. Leave empty to create them yourself from the stack outputs.
+  VerifyDomain:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create the SES domain identity. Set to false if the domain is already verified in this region.
+  ExistingRuleSetName:
+    Type: String
+    Default: ""
+    Description: Add the receipt rule to this rule set, which must already be the active one. Leave empty to create and activate a rule set.
+  AuthType:
+    Type: String
+    Default: AWS_IAM
+    AllowedValues: [AWS_IAM, NONE]
+    Description: AWS_IAM requires SigV4-signed requests. NONE makes the URL public; combine it with AccessToken unless the inboxes may be world-readable.
+  AccessToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: 'When set, every request must send the header "Authorization: Bearer <token>".'
+  RetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Days before a message expires.
+
+Conditions:
+  OwnsRuleSet: !Equals [!Ref ExistingRuleSetName, ""]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  CreatesIdentity: !Equals [!Ref VerifyDomain, "true"]
+  CreatesDkimRecords: !And [!Condition HasHostedZone, !Condition CreatesIdentity]
+  IsPublic: !Equals [!Ref AuthType, NONE]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-mail
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSesPuts
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${Bucket.Arn}/raw/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub
+                  - arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${RuleSetName}:receipt-rule/${AWS::StackName}
+                  - RuleSetName: !If [OwnsRuleSet, !Ref AWS::StackName, !Ref ExistingRuleSetName]
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub ${Bucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+
+  IngestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ingest
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogGroup.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub ${Bucket.Arn}/raw/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${Bucket.Arn}/mail/*
+              # Without it S3 answers 403 instead of NoSuchKey for a missing object.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Parses mail SES wrote to the bucket and files it under each recipient's mailbox.
+      Runtime: python3.15
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt IngestRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Environment:
+        Variables:
+          BUCKET: !Ref Bucket
+      Code:
+        ZipFile: |
+          import email
+          import email.header
+          import email.policy
+          import email.utils
+          import hashlib
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from urllib.parse import quote
+
+          import boto3
+
+          BUCKET = os.environ["BUCKET"]
+          MAX_RAW_BYTES = 10 * 1024 * 1024
+          MAX_BODY_CHARS = 200_000
+          SPECIAL_USERS = {"admin", "administrator", "hostmaster", "postmaster", "webmaster"}
+
+          s3 = boto3.client("s3")
+
+
+          def handler(event, context):
+              for record in event["Records"]:
+                  ses = record["ses"]
+                  message_id = ses["mail"]["messageId"]
+                  raw_key = "raw/" + message_id
+                  try:
+                      raw = s3.get_object(Bucket=BUCKET, Key=raw_key)["Body"].read(MAX_RAW_BYTES)
+                  except s3.exceptions.NoSuchKey:
+                      # A repeat delivery of an event that was already filed.
+                      print(json.dumps({"messageId": message_id, "skipped": "no raw object"}))
+                      continue
+                  received = datetime.fromisoformat(ses["receipt"]["timestamp"].replace("Z", "+00:00"))
+                  received_ms = round(received.timestamp() * 1000)
+                  mail = parse(raw)
+                  mail["receivedAt"] = iso(received_ms)
+                  body = json.dumps(mail, ensure_ascii=False).encode("utf-8", "replace")
+                  mailboxes = {r.lower() for r in ses["receipt"]["recipients"]}
+                  mailboxes = sorted(m for m in mailboxes if m.split("@")[0] not in SPECIAL_USERS)
+                  for mailbox in mailboxes:
+                      # Reversed timestamp: S3 lists keys ascending, so the newest message comes first.
+                      key = "mail/%s/%013d-%s.json" % (quote(mailbox, safe="@"), 9999999999999 - received_ms, message_id)
+                      s3.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType="application/json")
+                  s3.delete_object(Bucket=BUCKET, Key=raw_key)
+                  print(json.dumps({"messageId": message_id, "bytes": len(raw), "mailboxes": len(mailboxes)}))
+
+
+          def parse(raw):
+              msg = email.message_from_bytes(raw, policy=email.policy.default)
+              seen, people = {}, {}
+              for name, raw_value in msg.raw_items():
+                  name = name.lower()
+                  seen.setdefault(name, []).append(header_text(raw_value))
+                  if name in ("from", "to", "cc", "bcc"):
+                      try:
+                          found = msg.policy.header_fetch_parse(name, raw_value).addresses
+                      except Exception:
+                          found = ()
+                      people.setdefault(name, []).extend(
+                          {"address": a.addr_spec, "name": a.display_name} for a in found if a.addr_spec != "<>"
+                      )
+              headers = {name: values[0] if len(values) == 1 else values for name, values in seen.items()}
+
+              mail = {"headers": headers, "priority": priority(seen)}
+              for kind, field in (("plain", "text"), ("html", "html")):
+                  content = content_of(msg, kind)
+                  if content is not None:
+                      mail[field] = content
+              if "subject" in seen:
+                  mail["subject"] = seen["subject"][0]
+              if "message-id" in seen:
+                  mail["messageId"] = (ids(seen["message-id"][0]) or [seen["message-id"][0].strip()])[0]
+              for name, field in (("references", "references"), ("in-reply-to", "inReplyTo")):
+                  if name in seen and ids(seen[name][0]):
+                      mail[field] = ids(seen[name][0])
+              mail.update(people)
+              for name, value in (("date", seen.get("date", [""])[0]), ("receivedDate", seen.get("received", [""])[0].rpartition(";")[2])):
+                  parsed_date = iso_date(value)
+                  if parsed_date:
+                      mail[name] = parsed_date
+              files = attachments(msg)
+              if files:
+                  mail["attachments"] = files
+              if len(raw) >= MAX_RAW_BYTES:
+                  mail["truncated"] = True
+              return mail
+
+
+          def header_text(raw_value):
+              text = re.sub(r"\r?\n[ \t]*", " ", str(raw_value)).strip()
+              text = text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+              try:
+                  return str(email.header.make_header(email.header.decode_header(text)))
+              except Exception:
+                  return text
+
+
+          def content_of(msg, kind):
+              try:
+                  part = msg.get_body(preferencelist=(kind,))
+                  if part is None:
+                      return None
+                  try:
+                      content = part.get_content()
+                  except (LookupError, UnicodeError):
+                      content = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+              except Exception:
+                  return None
+              return content.replace("\r\n", "\n")[:MAX_BODY_CHARS]
+
+
+          def attachments(msg):
+              files = []
+              try:
+                  parts = list(msg.iter_attachments())
+              except Exception:
+                  return files
+              for part in parts:
+                  data = part.get_payload(decode=True) or b""
+                  name = part.get_filename()
+                  file = {
+                      "contentType": part.get_content_type(),
+                      "contentDisposition": part.get_content_disposition() or "attachment",
+                      "transferEncoding": str(part.get("content-transfer-encoding", "7bit")).lower(),
+                      "generatedFileName": name or "attachment",
+                      "checksum": hashlib.md5(data, usedforsecurity=False).hexdigest(),
+                      "length": len(data),
+                  }
+                  if name:
+                      file["fileName"] = name
+                  if part.get("content-id"):
+                      file["contentId"] = str(part["content-id"]).strip("<>")
+                  files.append(file)
+              return files
+
+
+          def priority(seen):
+              for name in ("x-priority", "x-msmail-priority", "importance"):
+                  value = seen.get(name, [""])[0].strip().lower()
+                  if value[:1] in ("1", "2") or value.startswith("high"):
+                      return "high"
+                  if value[:1] in ("4", "5") or value.startswith("low"):
+                      return "low"
+              return "normal"
+
+
+          def ids(value):
+              return re.findall(r"<([^<>\s]+)>", value)
+
+
+          def iso_date(value):
+              try:
+                  parsed = email.utils.parsedate_to_datetime(value.strip())
+              except (TypeError, ValueError):
+                  return None
+              if parsed.tzinfo is None:
+                  parsed = parsed.replace(tzinfo=timezone.utc)
+              return iso(round(parsed.timestamp() * 1000))
+
+
+          def iso(ms):
+              moment = datetime.fromtimestamp(ms // 1000, timezone.utc)
+              return "%s.%03dZ" % (moment.strftime("%Y-%m-%dT%H:%M:%S"), ms % 1000)
+
+  IngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IngestFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub
+        - arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${RuleSetName}:receipt-rule/${AWS::StackName}
+        - RuleSetName: !If [OwnsRuleSet, !Ref AWS::StackName, !Ref ExistingRuleSetName]
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogGroup.Arn
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub ${Bucket.Arn}/mail/*
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: GET and DELETE /mail/<user>.
+      Runtime: python3.15
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 15
+      Role: !GetAtt ApiRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Environment:
+        Variables:
+          BUCKET: !Ref Bucket
+          DOMAIN: !Ref Domain
+          RETENTION_DAYS: !Ref RetentionDays
+          TOKEN: !Ref AccessToken
+      Code:
+        ZipFile: |
+          import hmac
+          import json
+          import os
+          import time
+          from urllib.parse import quote, unquote
+
+          import boto3
+
+          BUCKET = os.environ["BUCKET"]
+          DOMAIN = os.environ["DOMAIN"].lower()
+          RETENTION_MS = int(os.environ["RETENTION_DAYS"]) * 86_400_000
+          TOKEN = os.environ.get("TOKEN", "")
+          MAX_MESSAGES = 10
+          # A function URL response is capped at 6 MB.
+          MAX_RESPONSE_BYTES = 5_000_000
+          SPECIAL_USERS = {"admin", "administrator", "hostmaster", "postmaster", "webmaster"}
+
+          s3 = boto3.client("s3")
+
+
+          def handler(event, context):
+              if TOKEN:
+                  given = (event.get("headers") or {}).get("authorization", "")
+                  if not hmac.compare_digest(given.encode(), ("Bearer " + TOKEN).encode()):
+                      return respond(401, '{"error": "unauthorized"}')
+              method = event["requestContext"]["http"]["method"]
+              path = unquote(event.get("rawPath", ""))
+              if not path.startswith("/mail/") or path == "/mail/":
+                  return respond(404, '{"error": "not found"}')
+              mailbox = path[len("/mail/"):].lower()
+              if "@" not in mailbox:
+                  mailbox += "@" + DOMAIN
+              prefix = "mail/%s/" % quote(mailbox, safe="@")
+              if method == "GET":
+                  if mailbox.split("@")[0] in SPECIAL_USERS:
+                      return respond(200, "[]")
+                  return respond(200, read(prefix))
+              if method == "DELETE":
+                  clear(prefix)
+                  return respond(200, "")
+              return respond(405, '{"error": "method not allowed"}')
+
+
+          def read(prefix):
+              listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=MAX_MESSAGES)
+              cutoff = int(time.time() * 1000) - RETENTION_MS
+              bodies, size = [], 0
+              for item in listing.get("Contents", []):
+                  received_ms = 9999999999999 - int(item["Key"][len(prefix):len(prefix) + 13])
+                  if received_ms < cutoff:
+                      break
+                  try:
+                      body = s3.get_object(Bucket=BUCKET, Key=item["Key"])["Body"].read()
+                  except s3.exceptions.NoSuchKey:
+                      continue
+                  size += len(body)
+                  if size > MAX_RESPONSE_BYTES:
+                      break
+                  bodies.append(body.decode())
+              return "[" + ",".join(reversed(bodies)) + "]"
+
+
+          def clear(prefix):
+              request = {"Bucket": BUCKET, "Prefix": prefix}
+              while True:
+                  listing = s3.list_objects_v2(**request)
+                  keys = [{"Key": item["Key"]} for item in listing.get("Contents", [])]
+                  if keys:
+                      s3.delete_objects(Bucket=BUCKET, Delete={"Objects": keys, "Quiet": True})
+                  if not listing.get("IsTruncated"):
+                      return
+                  request["ContinuationToken"] = listing["NextContinuationToken"]
+
+
+          def respond(status, body):
+              return {"statusCode": status, "headers": {"content-type": "application/json"}, "body": body}
+
+  ApiUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: !Ref AuthType
+
+  ApiUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPublic
+    Properties:
+      FunctionName: !GetAtt ApiFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPublic
+    Properties:
+      FunctionName: !GetAtt ApiFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  Identity:
+    Type: AWS::SES::EmailIdentity
+    Condition: CreatesIdentity
+    Properties:
+      EmailIdentity: !Ref Domain
+
+  MxRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref Domain
+      Type: MX
+      TTL: "300"
+      ResourceRecords:
+        - !Sub 10 inbound-smtp.${AWS::Region}.amazonaws.com
+
+  DkimRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: CreatesDkimRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !GetAtt Identity.DkimDNSTokenName1
+          Type: CNAME
+          TTL: "300"
+          ResourceRecords: [!GetAtt Identity.DkimDNSTokenValue1]
+        - Name: !GetAtt Identity.DkimDNSTokenName2
+          Type: CNAME
+          TTL: "300"
+          ResourceRecords: [!GetAtt Identity.DkimDNSTokenValue2]
+        - Name: !GetAtt Identity.DkimDNSTokenName3
+          Type: CNAME
+          TTL: "300"
+          ResourceRecords: [!GetAtt Identity.DkimDNSTokenValue3]
+
+  RuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Condition: OwnsRuleSet
+    Properties:
+      RuleSetName: !Ref AWS::StackName
+
+  Rule:
+    Type: AWS::SES::ReceiptRule
+    # SES checks it can write to the bucket and invoke the function when the rule is created.
+    DependsOn: [BucketPolicy, IngestPermission]
+    Properties:
+      RuleSetName: !If [OwnsRuleSet, !Ref RuleSet, !Ref ExistingRuleSetName]
+      Rule:
+        Name: !Ref AWS::StackName
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: Optional
+        Recipients:
+          - !Ref Domain
+        Actions:
+          - S3Action:
+              BucketName: !Ref Bucket
+              ObjectKeyPrefix: raw/
+          - LambdaAction:
+              FunctionArn: !GetAtt IngestFunction.Arn
+              InvocationType: Event
+
+  ActivateRole:
+    Type: AWS::IAM::Role
+    Condition: OwnsRuleSet
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: activate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogGroup.Arn
+              - Effect: Allow
+                Action: [ses:DescribeActiveReceiptRuleSet, ses:SetActiveReceiptRuleSet]
+                Resource: "*"
+
+  ActivateFunction:
+    Type: AWS::Lambda::Function
+    Condition: OwnsRuleSet
+    Properties:
+      Description: Custom resource that makes the stack's receipt rule set the active one.
+      Runtime: python3.15
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt ActivateRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          import boto3
+
+          ses = boto3.client("ses")
+
+
+          def handler(event, context):
+              name = event["ResourceProperties"]["RuleSetName"]
+              status, reason = "SUCCESS", "ok"
+              try:
+                  active = ses.describe_active_receipt_rule_set().get("Metadata", {}).get("Name")
+                  if event["RequestType"] == "Delete":
+                      # SES refuses to delete an active rule set; stand down only if it is still ours.
+                      if active == name:
+                          ses.set_active_receipt_rule_set()
+                  elif active and active != name:
+                      # SES has one active rule set per region; replacing it would stop someone else's mail.
+                      raise RuntimeError(
+                          "Receipt rule set %r is already active in this region. "
+                          "Pass it as ExistingRuleSetName, or deploy to another region." % active
+                      )
+                  elif not active:
+                      ses.set_active_receipt_rule_set(RuleSetName=name)
+              except Exception as error:
+                  print(repr(error))
+                  status, reason = "FAILED", str(error)
+              response = {
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": event.get("PhysicalResourceId", "active-rule-set-" + name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+              }
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=json.dumps(response).encode(),
+                  method="PUT",
+                  headers={"Content-Type": ""},
+              )
+              urllib.request.urlopen(request, timeout=10)
+
+  ActiveRuleSet:
+    Type: Custom::ActiveReceiptRuleSet
+    Condition: OwnsRuleSet
+    DependsOn: Rule
+    Properties:
+      ServiceToken: !GetAtt ActivateFunction.Arn
+      ServiceTimeout: 120
+      RuleSetName: !Ref RuleSet
+
+Outputs:
+  Url:
+    Description: Base URL of the API. Mail for <user> is at <Url>mail/<user>.
+    Value: !GetAtt ApiUrl.FunctionUrl
+  ApiFunctionArn:
+    Description: With AuthType AWS_IAM, callers need lambda:InvokeFunctionUrl and lambda:InvokeFunction on this function.
+    Value: !GetAtt ApiFunction.Arn
+  BucketName:
+    Description: Bucket holding the mail. Empty it before deleting the stack.
+    Value: !Ref Bucket
+  MxRecord:
+    Description: MX record the domain needs (created for you when HostedZoneId is set).
+    Value: !Sub ${Domain} MX 10 inbound-smtp.${AWS::Region}.amazonaws.com
+  DkimRecords:
+    Condition: CreatesIdentity
+    Description: CNAME records that verify the domain with SES (created for you when HostedZoneId is set).
+    Value: !Sub >-
+      ${Identity.DkimDNSTokenName1} CNAME ${Identity.DkimDNSTokenValue1},
+      ${Identity.DkimDNSTokenName2} CNAME ${Identity.DkimDNSTokenValue2},
+      ${Identity.DkimDNSTokenName3} CNAME ${Identity.DkimDNSTokenValue3}

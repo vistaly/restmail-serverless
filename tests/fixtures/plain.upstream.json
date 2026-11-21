@@ -1,0 +1,35 @@
+{
+  "text": "Your code is 12345678.\n",
+  "headers": {
+    "return-path": "<ada@example.com>",
+    "received": [
+      "from mail.example.com (mail.example.com [192.0.2.1]) by inbound-smtp.us-east-1.amazonaws.com with SMTP id abc123 for <test@inbox.example.com>; Fri, 20 Nov 2026 18:00:01 +0000 (UTC)",
+      "from localhost (localhost [127.0.0.1]) by mail.example.com with ESMTP id def456; Fri, 20 Nov 2026 18:00:00 +0000"
+    ],
+    "from": "Ada Lovelace <ada@example.com>",
+    "to": "Test Inbox <test@inbox.example.com>",
+    "subject": "Your sign-in code",
+    "date": "Fri, 20 Nov 2026 13:00:00 -0500",
+    "message-id": "<plain-1@example.com>",
+    "mime-version": "1.0",
+    "content-type": "text/plain; charset=utf-8",
+    "x-verify-code": "12345678"
+  },
+  "subject": "Your sign-in code",
+  "messageId": "plain-1@example.com",
+  "priority": "normal",
+  "from": [
+    {
+      "address": "ada@example.com",
+      "name": "Ada Lovelace"
+    }
+  ],
+  "to": [
+    {
+      "address": "test@inbox.example.com",
+      "name": "Test Inbox"
+    }
+  ],
+  "date": "2026-11-20T18:00:00.000Z",
+  "receivedDate": "2026-11-20T18:00:01.000Z"
+}

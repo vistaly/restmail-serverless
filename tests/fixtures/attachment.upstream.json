@@ -1,0 +1,48 @@
+{
+  "text": "See the attached report.\n",
+  "headers": {
+    "from": "Reports <reports@example.com>",
+    "to": "test@inbox.example.com",
+    "subject": "Report attached",
+    "date": "Fri, 20 Nov 2026 18:15:00 +0000",
+    "message-id": "<att-4@example.com>",
+    "mime-version": "1.0",
+    "content-type": "multipart/mixed; boundary=\"b2\""
+  },
+  "subject": "Report attached",
+  "messageId": "att-4@example.com",
+  "priority": "normal",
+  "from": [
+    {
+      "address": "reports@example.com",
+      "name": "Reports"
+    }
+  ],
+  "to": [
+    {
+      "address": "test@inbox.example.com",
+      "name": ""
+    }
+  ],
+  "date": "2026-11-20T18:15:00.000Z",
+  "attachments": [
+    {
+      "contentType": "application/pdf",
+      "fileName": "report.pdf",
+      "contentDisposition": "attachment",
+      "transferEncoding": "base64",
+      "generatedFileName": "report.pdf",
+      "contentId": "5c6813f49dfba292cc1008edce1c90e2@mailparser",
+      "stream": {
+        "_events": {},
+        "_eventsCount": 0,
+        "writable": true,
+        "checksum": {},
+        "length": 48,
+        "current": ""
+      },
+      "checksum": "cc5cb777a0b4db069ab4cc1f855b7768",
+      "length": 48
+    }
+  ]
+}

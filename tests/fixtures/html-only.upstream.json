@@ -1,0 +1,29 @@
+{
+  "html": "<html><body><p>Your verification code is <strong>24681357</strong>.</p><p>It expires in 10 minutes.</p></body></html>\n",
+  "headers": {
+    "from": "no-reply@example.com",
+    "to": "signup@inbox.example.com",
+    "subject": "Your verification code",
+    "date": "Fri, 20 Nov 2026 18:10:00 +0000",
+    "message-id": "<html-3@example.com>",
+    "mime-version": "1.0",
+    "content-type": "text/html; charset=UTF-8",
+    "content-transfer-encoding": "quoted-printable"
+  },
+  "subject": "Your verification code",
+  "messageId": "html-3@example.com",
+  "priority": "normal",
+  "from": [
+    {
+      "address": "no-reply@example.com",
+      "name": ""
+    }
+  ],
+  "to": [
+    {
+      "address": "signup@inbox.example.com",
+      "name": ""
+    }
+  ],
+  "date": "2026-11-20T18:10:00.000Z"
+}
