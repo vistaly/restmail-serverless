@@ -1,0 +1,17 @@
+Return-Path: <ada@example.com>
+Received: from mail.example.com (mail.example.com [192.0.2.1])
+ by inbound-smtp.us-east-1.amazonaws.com with SMTP id abc123
+ for <test@inbox.example.com>; Fri, 20 Nov 2026 18:00:01 +0000 (UTC)
+Received: from localhost (localhost [127.0.0.1])
+ by mail.example.com with ESMTP id def456;
+ Fri, 20 Nov 2026 18:00:00 +0000
+From: Ada Lovelace <ada@example.com>
+To: Test Inbox <test@inbox.example.com>
+Subject: Your sign-in code
+Date: Fri, 20 Nov 2026 13:00:00 -0500
+Message-ID: <plain-1@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+X-Verify-Code: 12345678
+
+Your code is 12345678.

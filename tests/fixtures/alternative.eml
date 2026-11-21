@@ -1,0 +1,25 @@
+From: =?UTF-8?Q?Jos=C3=A9_Mart=C3=ADnez?= <jose@example.com>
+To: First <first@inbox.example.com>, second@inbox.example.com
+Cc: "Third, Person" <third@inbox.example.com>
+Subject: =?UTF-8?B?QmllbnZlbnVlIMOgIGJvcmQg4pyI?=
+Date: Fri, 20 Nov 2026 18:05:00 +0000
+Message-ID: <alt-2@example.com>
+In-Reply-To: <plain-1@example.com>
+References: <root-0@example.com> <plain-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="b1"
+
+--b1
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Un caf=C3=A9, s'il vous pla=C3=AEt.
+Code: 87654321
+
+--b1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: base64
+
+PHA+VW4gY2Fmw6ksIHMnaWwgdm91cyBwbGHDrnQuPC9wPjxwPkNvZGU6IDxiPjg3NjU0MzIxPC9iPjwvcD4=
+
+--b1--

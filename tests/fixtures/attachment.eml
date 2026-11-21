@@ -1,0 +1,21 @@
+From: Reports <reports@example.com>
+To: test@inbox.example.com
+Subject: Report attached
+Date: Fri, 20 Nov 2026 18:15:00 +0000
+Message-ID: <att-4@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b2"
+
+--b2
+Content-Type: text/plain; charset=us-ascii
+
+See the attached report.
+
+--b2
+Content-Type: application/pdf; name="report.pdf"
+Content-Disposition: attachment; filename="report.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQgbm90IGEgcmVhbCBwZGYsIGp1c3QgdHdlbnR5LW5pbmUrIGJ5dGVz
+
+--b2--
